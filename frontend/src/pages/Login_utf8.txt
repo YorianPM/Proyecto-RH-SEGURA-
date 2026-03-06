@@ -1,0 +1,116 @@
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import api from '../api';
+import './Login.css';
+
+export default function Login() {
+  const [usuario, setUsuario] = useState('');
+  const [contrasena, setContrasena] = useState('');
+  const [msg, setMsg] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const navigate = useNavigate();
+  const auth = useAuth();
+
+  const onSubmit = async (e) => {
+    e.preventDefault();
+    setMsg('Verificando…');
+    setLoading(true);
+    try {
+      const { data } = await api.post('/auth/login', { usuario, contrasena });
+      if (data?.ok && data?.token) {
+        auth?.loginOk(data.token, data.user || { usuario });
+        navigate('/', { replace: true });
+      } else {
+        setMsg(data?.message || 'Credenciales inválidas');
+      }
+    } catch (err) {
+      setMsg(err?.response?.data?.message || 'Error de conexión');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="login-view position-relative">
+      <div className="login-bg" />
+      <div className="container py-5">
+        <div className="row align-items-center min-vh-100 py-lg-5 g-4">
+          {/* Left: Form */}
+          <div className="col-12 col-lg-6 order-2 order-lg-1">
+            <div className="glass-card login-card border-0 shadow-lg p-4 p-md-5">
+              <div className="d-flex align-items-center mb-3 gap-2 brand">
+                <img src="/logo-rhsegurasinfondo.png" alt="RH Segura" className="brand-logo" />
+                <span className="brand-name">RH SEGURA</span>
+              </div>
+              <h2 className="mb-1 fw-bold">Bienvenido</h2>
+              <p className="text-secondary mb-4">Inicia sesión para continuar</p>
+
+              <form onSubmit={onSubmit} className="d-grid gap-3" autoComplete="off">
+                <div className="field">
+                  <label className="form-label">Correo o cédula</label>
+                  <div className="input-wrapper">
+                    <span className="input-icon" aria-hidden>✉️</span>
+                    <input
+                      className="form-control form-control-lg"
+                      value={usuario}
+                      onChange={(e) => setUsuario(e.target.value)}
+                      placeholder="admin@empresa.com"
+                      autoFocus
+                    />
+                  </div>
+                </div>
+                <div className="field">
+                  <label className="form-label">Contraseña</label>
+                  <div className="input-wrapper">
+                    <span className="input-icon" aria-hidden>🔒</span>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      className="form-control form-control-lg"
+                      value={contrasena}
+                      onChange={(e) => setContrasena(e.target.value)}
+                      placeholder="••••••••"
+                    />
+                    <button
+                      type="button"
+                      className="toggle-pass"
+                      onClick={() => setShowPassword((v) => !v)}
+                      aria-label={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+                    >
+                      {showPassword ? '🙈' : '👁️'}
+                    </button>
+                  </div>
+                </div>
+                <button className="btn btn-primary btn-lg w-100 login-cta" disabled={loading}>
+                  {loading ? 'Entrando…' : 'Entrar'}
+                </button>
+                {msg && (
+                  <div className="alert alert-warning mb-0 py-2 small text-center" role="alert">
+                    {msg}
+                  </div>
+                )}
+                <div className="text-center text-secondary small mt-1">
+                  © {new Date().getFullYear()} RH Segura
+                </div>
+              </form>
+            </div>
+          </div>
+
+          {/* Right: Illustration */}
+          <div className="col-12 col-lg-6 order-1 order-lg-2 d-flex justify-content-center justify-content-lg-end">
+            <div className="login-hero text-center">
+              <picture>
+                <source media="(max-width: 991px)" srcSet="/imagelogincel.png" />
+                <img src="/imglog.png" alt="RH Segura" className="hero-img img-fluid" />
+              </picture>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+

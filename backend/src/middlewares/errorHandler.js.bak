@@ -1,0 +1,24 @@
+﻿function serializeError(err) {
+  return {
+    name: err.name,
+    code: err.code,
+    message: err.message,
+    number: err.number,
+    state: err.state,
+    class: err.class,
+    serverName: err.serverName,
+    procName: err.procName,
+    lineNumber: err.lineNumber,
+    original: err.original || err.originalError || null
+  };
+}
+
+module.exports = (err, req, res, next) => {
+  console.error('âŒ Error detallado:', serializeError(err));
+  const status = err.status || 500;
+  res.status(status).json({
+    ok: false,
+    status,
+    error: serializeError(err)
+  });
+};

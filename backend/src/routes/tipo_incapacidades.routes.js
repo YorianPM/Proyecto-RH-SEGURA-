@@ -1,0 +1,1 @@
+const express = require('express');const router = express.Router();const ctrl = require('../controllers/tipo_incapacidad.controller');router.get('/', ctrl.getAll);module.exports = router;

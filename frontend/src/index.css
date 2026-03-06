@@ -1,0 +1,211 @@
+:root{
+  /* Paleta principal */
+  --primary: #fbc02d; /* amarillo corporativo */
+  --primary-600: #e0aa00;
+  --primary-700: #b08700;
+  --surface: #2a2a2e; /* gris muy oscuro */
+  --surface-2: #343438;
+  --border: #3d3d42;
+  --text: #f3f4f6;
+  --text-muted: #a1a1aa;
+  --accent: var(--primary);
+
+  /* Bootstrap 5.3 variables (tema dark) */
+  --bs-primary: var(--primary);
+  --bs-primary-rgb: 251,192,45;
+  --bs-link-color: var(--primary);
+  --bs-link-hover-color: #ffd54f;
+  --bs-body-bg: var(--surface);
+  --bs-body-color: var(--text);
+  --bs-border-color: var(--border);
+}
+
+/* Botón primario: leve redondeo y peso */
+.btn-primary{
+  border-radius: .6rem;
+  font-weight: 600;
+}
+
+/* Navbar personalizada */
+.app-navbar{
+  background-color: var(--surface) !important;
+  border-bottom: 1px solid var(--bs-border-color);
+}
+.app-navbar .navbar-brand,
+.app-navbar .nav-link{
+  color: var(--text) !important;
+}
+.app-navbar .nav-link.active,
+.app-navbar .nav-link:hover{
+  color: var(--primary) !important;
+}
+.navbar-brand img{
+  height: 28px;
+  width: auto;
+}
+
+/* Tarjetas: afinado para el dashboard */
+.card{
+  background-color: var(--surface-2);
+  border-color: var(--bs-border-color);
+}
+.card-title{ color: var(--text); }
+.card-text{ color: var(--text-muted); }
+
+/* Dropdown simple para menú de 3 puntos */
+.kebab-btn{
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.kebab-btn:hover{ color: var(--text); background: rgba(255,255,255,0.04); }
+.kebab-menu{
+  position: absolute;
+  top: 36px;
+  right: 0;
+  background: var(--surface);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+  min-width: 180px;
+  z-index: 20;
+}
+.kebab-item{
+  display: block;
+  padding: 8px 12px;
+  color: var(--text);
+  text-decoration: none;
+}
+.kebab-item:hover{ background: rgba(255,255,255,0.06); color: var(--primary); }
+
+/* Drawer lateral (menú hamburguesa) */
+.hamburger-btn{
+  border: none;
+  background: transparent;
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 20px;
+  line-height: 1;
+  border-radius: 8px;
+}
+.hamburger-btn:hover{ background: rgba(255,255,255,0.06); }
+
+.drawer-backdrop{
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.45);
+  z-index: 1040;
+}
+.app-drawer{
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 280px;
+  background: var(--surface);
+  border-right: 1px solid var(--bs-border-color);
+  transform: translateX(-100%);
+  transition: transform .25s ease;
+  z-index: 1050;
+  display: flex;
+  flex-direction: column;
+}
+.app-drawer.open{ transform: translateX(0); }
+.drawer-header{ padding: 12px 14px; border-bottom: 1px solid var(--bs-border-color); }
+.drawer-content{ padding: 10px; overflow-y: auto; }
+.menu-section{ margin-bottom: 12px; }
+.menu-section-title{ font-size: 12px; color: var(--text-muted); text-transform: uppercase; margin: 6px 8px; }
+.menu-item{
+  display: block;
+  padding: 10px 12px;
+  color: var(--text);
+  text-decoration: none;
+  border-radius: 8px;
+}
+.menu-item:hover{ background: rgba(255,255,255,0.06); color: var(--primary); }
+
+/* Contenedores a todo ancho (evitar vacíos laterales) */
+.container,
+.container-sm,
+.container-md,
+.container-lg,
+.container-xl,
+.container-xxl{
+  max-width: 100% !important;
+  padding-left: 24px;
+  padding-right: 24px;
+}
+@media (min-width: 1400px){
+  .container,
+  .container-xxl{ padding-left: 32px; padding-right: 32px; }
+}
+
+
+/* Hero del dashboard */
+.hero-banner{
+  position: relative;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 16px;
+  padding: 28px 20px;
+  background:
+    radial-gradient(600px 220px at 50% -100px, rgba(251,192,45,0.24), transparent),
+    linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0));
+}
+.hero-banner h4{ margin-bottom: 6px; }
+.hero-banner p{ color: var(--text-muted); margin: 0; }
+
+.app-shell{
+  min-height: 100%;
+  background-color: var(--surface);
+}
+
+.app-shell main{
+  flex: 1 0 auto;
+  min-width: 0;
+}
+
+.app-footer{
+  color: var(--text-muted);
+}
+
+.login-view .app-footer{
+  margin-top: 4rem;
+}
+
+html,
+body,
+#root{
+  height: 100%;
+}
+
+/* Tarjetas del dashboard */
+.dashboard-grid{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+}
+.dash-card{
+  background: transparent; /* sin cuadros */
+  border: none;
+  border-radius: 0;
+  padding: 8px 4px;
+  text-decoration: none;
+  color: var(--text);
+  transition: color .15s ease;
+}
+.dash-card:hover .title{ color: var(--primary); }
+.dash-card::before{ display: none; }
+.dash-card::after{
+  content: ""; position: absolute; width: 6px; height: 6px; border-radius: 999px;
+  left: var(--ripple-x, 50%); top: var(--ripple-y, 50%);
+  transform: translate(-50%, -50%) scale(0);
+  background: rgba(251,192,45,.15);
+  opacity: 0; pointer-events: none;
+}
+.dash-card[data-rippling='true']::after{ display: none; }
+.dash-card .icon{ font-size: 28px; line-height: 1; }
+.dash-card .title{ font-weight: 600; margin-top: 8px; }
+.dash-card .desc{ color: var(--text-muted); font-size: .92rem; margin-top: 2px; }
+/* (Eliminado) Indicador de atajo visual */

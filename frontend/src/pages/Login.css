@@ -1,0 +1,170 @@
+﻿/* Vista del login: fondo sutil y acentos corporativos */
+.login-view {
+  min-height: calc(100dvh - 80px); /* Deja espacio para que el footer se vea */
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center; /* Baja los cards al centro */
+}
+
+/* Contenedor principal */
+.login-container {
+  width: 100%;
+}
+
+/* Ajuste de la posición general de las tarjetas */
+.login-shell {
+  width: min(1080px, 100%);
+  margin: 0 auto;
+  margin-bottom: 20px; /* Evita que se pegue al footer */
+}
+
+/* Grid general */
+.login-grid {
+  row-gap: 1.5rem !important;
+  min-height: min(78vh, 680px); /* Antes 85vh/720px → esto baja el bloque */
+  --bs-gutter-x: clamp(1rem, 2.5vw, 2rem);
+}
+
+@media (min-width: 992px) {
+  .login-grid {
+    padding: 1rem 0;
+  }
+}
+
+/* Fondo */
+.login-bg {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(600px 300px at 10% -10%, rgba(251,192,45,0.12), transparent 70%),
+    radial-gradient(600px 300px at 110% 110%, rgba(251,192,45,0.10), transparent 70%),
+    linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0));
+  pointer-events: none;
+}
+
+/* Tarjeta con efecto glass */
+.glass-card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.35);
+}
+
+/* Tarjeta login */
+.login-card {
+  max-width: 520px;
+  width: 100%;
+  margin: 0 auto;
+  animation: fadeIn .5s ease-out;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 1.2rem !important; /* Compacto */
+}
+
+/* Panel marca */
+.brand-panel {
+  border-radius: 20px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  background: linear-gradient(135deg, rgba(251,192,45,0.08), rgba(251,192,45,0.01));
+  border: 1px solid rgba(255,255,255,0.05);
+  padding: 1.2rem !important; /* Compacto */
+}
+
+.brand-panel-logo img {
+  width: clamp(150px, 18vw, 240px);
+  height: auto;
+}
+
+.brand-panel-title {
+  font-size: clamp(1.6rem, 2.1vw, 2rem);
+  font-weight: 700;
+  margin-bottom: 1rem;
+}
+
+.brand-panel-text {
+  color: #ddd;
+  margin-bottom: 0;
+  line-height: 1.6;
+}
+
+/* Encabezado marca */
+.brand .brand-logo { height: 44px; width: auto; }
+.brand .brand-name { font-weight: 800; letter-spacing: .5px; }
+
+/* Inputs */
+.login-card .field { display: grid; gap: 6px; }
+.login-card .input-wrapper { position: relative; }
+
+.login-card .form-control {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--bs-border-color);
+  color: var(--text);
+  border-radius: 12px;
+  height: 48px;
+  padding-left: 44px;
+}
+
+.login-card .form-control::placeholder { color: var(--text-muted); }
+
+.login-card .form-control:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 .2rem rgba(251,192,45,.15);
+}
+
+.input-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: .85;
+}
+
+.toggle-pass {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.toggle-pass:hover { color: var(--text); }
+
+/* Botón */
+.login-cta {
+  border-radius: 12px;
+  font-weight: 700;
+  box-shadow: 0 8px 24px rgba(251,192,45,0.18);
+}
+
+.login-cta:hover {
+  box-shadow: 0 10px 30px rgba(251,192,45,0.26);
+}
+
+/* Animaciones */
+.animate-fade-in{
+  animation: fadeIn .6s ease-out;
+}
+
+.animate-slide-up{
+  animation: slideUp .7s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}

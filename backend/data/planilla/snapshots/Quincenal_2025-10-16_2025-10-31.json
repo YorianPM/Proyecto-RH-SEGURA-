@@ -1,0 +1,66 @@
+{
+  "tasas": {
+    "ccss_obrero": 0.1067,
+    "banco_popular_obrero": 0.01,
+    "patronal_total": 0.2667
+  },
+  "tramos": [
+    {
+      "idRenta_tramo": 1022,
+      "vigencia_desde": "2025-01-01T00:00:00.000Z",
+      "vigencia_hasta": null,
+      "monto_min": 0,
+      "monto_max": 922000,
+      "tasa_pct": 0
+    },
+    {
+      "idRenta_tramo": 1023,
+      "vigencia_desde": "2025-01-01T00:00:00.000Z",
+      "vigencia_hasta": null,
+      "monto_min": 922001,
+      "monto_max": 1352000,
+      "tasa_pct": 10
+    },
+    {
+      "idRenta_tramo": 1024,
+      "vigencia_desde": "2025-01-01T00:00:00.000Z",
+      "vigencia_hasta": null,
+      "monto_min": 1352001,
+      "monto_max": 2373000,
+      "tasa_pct": 15
+    },
+    {
+      "idRenta_tramo": 1025,
+      "vigencia_desde": "2025-01-01T00:00:00.000Z",
+      "vigencia_hasta": null,
+      "monto_min": 2373001,
+      "monto_max": 4745000,
+      "tasa_pct": 20
+    },
+    {
+      "idRenta_tramo": 1026,
+      "vigencia_desde": "2025-01-01T00:00:00.000Z",
+      "vigencia_hasta": null,
+      "monto_min": 4745001,
+      "monto_max": null,
+      "tasa_pct": 25
+    }
+  ],
+  "params": {
+    "periodo": "quincenal",
+    "fecha_inicio": "2025-10-16",
+    "fecha_fin": "2025-10-31",
+    "horas_mes": 192,
+    "tasa_he": 1.5,
+    "base_renta": "bruto"
+  },
+  "totales": {
+    "totalBruto": 20031636.73,
+    "totalObrero": 2137375.63,
+    "totalBancoPopular": 200316.38,
+    "totalRenta": 4353916.67,
+    "totalNeto": 13340028.05,
+    "totalPatronal": 5342437.51
+  },
+  "costo_total_empresa": 25374074.24
+}

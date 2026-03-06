@@ -1,0 +1,114 @@
+.btn-logout {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-left: 10px;
+}
+
+.btn-logout:hover {
+  background: var(--accent);
+  color: #000;
+}
+
+.navbar-app-title {
+  color: #f8f9fa;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.app-navbar .navbar-brand {
+  margin-right: 0;
+}
+
+.navbar-bell {
+  position: relative;
+}
+
+.navbar-bell-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+
+.navbar-bell-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.navbar-bell-btn:hover {
+  background: var(--accent);
+  color: #000;
+}
+
+.navbar-bell-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  background: #dc3545;
+  color: #fff;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 0.65rem;
+  line-height: 1.4;
+}
+
+.navbar-bell-menu {
+  position: absolute;
+  top: 44px;
+  right: 0;
+  width: 280px;
+  background: #212529;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+  padding: 12px;
+  z-index: 20;
+}
+
+.navbar-bell-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.9rem;
+}
+
+.navbar-bell-header a {
+  font-size: 0.8rem;
+}
+
+.navbar-bell-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.navbar-bell-item {
+  background: rgba(248,249,250,0.05);
+  border-radius: 6px;
+  padding: 8px;
+}

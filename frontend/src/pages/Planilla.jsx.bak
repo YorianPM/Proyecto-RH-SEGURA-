@@ -1,0 +1,638 @@
+import { useMemo, useState, useEffect } from 'react';
+import { useAuth } from '../context/AuthContext';
+import {
+  previewPlanillaCR as previewPlanilla,
+  generarPlanilla,
+  detallePlanilla,
+  overridePlanilla,
+  cerrarPlanillaRango,
+  downloadPlanillaPdf,
+  getPlanillaConfig,
+  savePlanillaConfig,
+} from '../api/planilla';
+
+// ===== Helpers =====
+function fmt(n) {
+  const v = Number(n || 0);
+  return v.toLocaleString('es-CR', { style: 'currency', currency: 'CRC', maximumFractionDigits: 2 });
+}
+
+// YYYY-MM-DD con hora local (evita desfases por zona horaria)
+function toYMD(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function todayISO() { return toYMD(new Date()); }
+
+function defaultPeriodoFechas() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const day = d.getDate();
+  if (day <= 15) {
+    return { periodo: 'quincenal', desde: toYMD(new Date(y, m, 1)), hasta: toYMD(new Date(y, m, 15)) };
+  } else {
+    const lastDay = new Date(y, m + 1, 0).getDate();
+    return { periodo: 'quincenal', desde: toYMD(new Date(y, m, 16)), hasta: toYMD(new Date(y, m, lastDay)) };
+  }
+}
+
+// Normaliza a YYYY-MM-DD sin toISOString()
+function toISO(s) {
+  if (!s) return s;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = String(s).match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  const d = new Date(s);
+  if (!isNaN(d)) return toYMD(d);
+  return s;
+}
+
+function parseNum(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  const s = String(v).replace(',', '.');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function EditableCell({ value, onSave, disabled }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(value);
+  useEffect(() => { setVal(value); }, [value]);
+  if (disabled) return <span>{fmt(value)}</span>;
+  return (
+    <div>
+      {editing ? (
+        <div className="d-flex gap-1">
+          <input
+            type="number"
+            className="form-control form-control-sm"
+            value={val}
+            onChange={(e) => setVal(Number(e.target.value) || 0)}
+            style={{ maxWidth: 120 }}
+          />
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={() => {
+              const motivo = prompt('Motivo del cambio');
+              if (motivo !== null) { onSave(Number(val) || 0, motivo); setEditing(false); }
+            }}
+          >
+            Guardar
+          </button>
+          <button className="btn btn-sm btn-light" onClick={() => { setVal(value); setEditing(false); }}>
+            Cancelar
+          </button>
+        </div>
+      ) : (
+        <div className="d-flex justify-content-between align-items-center">
+          <span>{fmt(value)}</span>
+          <button className="btn btn-sm btn-outline-secondary" onClick={() => setEditing(true)} title="Editar" aria-label="Editar">
+            ?
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const HE_TYPES = [
+  { key: 'ordinaria', label: 'Ordinaria (tiempo y medio)', factor: 1.5 },
+  { key: 'nocturna', label: 'Nocturna', factor: 1.5 },
+  { key: 'feriado', label: 'Feriado (doble)', factor: 2.0 },
+  { key: 'personalizada', label: 'Personalizada', factor: null },
+];
+
+export default function Planilla() {
+  const { hasPerm } = useAuth();
+  const def = useMemo(defaultPeriodoFechas, []);
+  const [periodo, setPeriodo] = useState(def.periodo);
+  const [desde, setDesde] = useState(def.desde);
+  const [hasta, setHasta] = useState(def.hasta);
+  const [horasMes, setHorasMes] = useState(192);
+  const [tipoHE, setTipoHE] = useState('ordinaria');
+  const [tasaHE, setTasaHE] = useState(1.5);
+  const [rentaBase, setRentaBase] = useState('Bruto');
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [rowsPrev, setRowsPrev] = useState([]);
+  const [totalesPrev, setTotalesPrev] = useState(null);
+  const [rowsDB, setRowsDB] = useState([]);
+  const [snapshot, setSnapshot] = useState(null);
+  const [locked, setLocked] = useState(false);
+  const [genMsg, setGenMsg] = useState('');
+  const [cfgOpen, setCfgOpen] = useState(false);
+  const [cfg, setCfg] = useState({ ccss_obrero: 0.1034, banco_popular_obrero: 0.01, patronal_total: 0.2633 });
+  const [cfgAnio, setCfgAnio] = useState(new Date(hasta).getFullYear());
+  const [cfgMsg, setCfgMsg] = useState('');
+  const [cfgSummary, setCfgSummary] = useState({
+    anio: new Date(hasta).getFullYear(),
+    ccss_obrero: 0.1034,
+    banco_popular_obrero: 0.01,
+    patronal_total: 0.2633,
+  });
+
+  function rangoValido() {
+    if (!desde || !hasta) return false;
+    return new Date(desde) <= new Date(hasta);
+  }
+
+  async function doPreview() {
+    try {
+      if (!rangoValido()) { setError('Rango de fechas inválido'); return; }
+      setLoading(true); setError(''); setGenMsg('');
+      const payload = { periodo, fecha_inicio: toISO(desde), fecha_fin: toISO(hasta), horas_mes: horasMes, tasa_he: tasaHE, base_renta: rentaBase };
+      const r = await previewPlanilla(payload);
+      setRowsPrev(r?.filas || []);
+      setTotalesPrev({ ...(r?.totales || {}), costoTotalEmpresa: r?.costo_total_empresa || 0 });
+    } catch (e) {
+      setRowsPrev([]); setTotalesPrev(null);
+      setError(e?.response?.data?.error?.message || e?.response?.data?.message || e.message || 'Error al previsualizar');
+    } finally { setLoading(false); }
+  }
+
+  async function doGenerar() {
+    try {
+      if (!rangoValido()) { setError('Rango de fechas inválido'); return; }
+      setLoading(true); setError('');
+      const payload = { periodo, fecha_inicio: toISO(desde), fecha_fin: toISO(hasta), horas_mes: horasMes, tasa_he: tasaHE, base_renta: rentaBase };
+      const r = await generarPlanilla(payload);
+      if (!r?.ok) throw new Error(r?.message || 'No se pudo generar');
+      setGenMsg('Planilla generada');
+      await loadPersisted();
+    } catch (e) {
+      const msg = e?.response?.status === 409 ? 'Planilla cerrada para este rango'
+        : (e?.response?.data?.error?.message || e?.response?.data?.message || e.message || 'Error al generar');
+      setError(msg);
+    } finally { setLoading(false); }
+  }
+
+  async function loadPersisted() {
+    try {
+      setLoading(true); setError('');
+      const { ok, data, snapshot: snap, locked: isL } = await detallePlanilla({ periodo, desde: toISO(desde), hasta: toISO(hasta) });
+      if (!ok) throw new Error('No se pudo cargar detalle');
+      setRowsDB(data || []);
+      setSnapshot(snap || null);
+      setLocked(!!isL);
+    } catch (e) {
+      setRowsDB([]); setSnapshot(null); setLocked(false);
+      setError(e?.response?.data?.error?.message || e?.response?.data?.message || e.message || 'Error al cargar detalle');
+    } finally { setLoading(false); }
+  }
+
+  async function loadConfig() {
+    try {
+      const anio = new Date(hasta).getFullYear();
+      setCfgAnio(anio);
+      const data = await getPlanillaConfig(anio);
+      setCfg({
+        ccss_obrero: Number(data?.ccss_obrero ?? 0.1034),
+        banco_popular_obrero: Number(data?.banco_popular_obrero ?? 0.01),
+        patronal_total: Number(data?.patronal_total ?? 0.2633),
+      });
+      setCfgOpen(true);
+      setCfgMsg('');
+    } catch {
+      setCfgOpen(true);
+      setCfgMsg('No se pudo cargar la configuración. Usando valores por defecto.');
+    }
+  }
+
+  async function saveConfig() {
+    try {
+      setCfgMsg('');
+      await savePlanillaConfig(cfgAnio, cfg);
+      setCfgSummary({ anio: cfgAnio, ...cfg });
+      setCfgMsg('Guardado. Nuevos cálculos usarán estas tasas.');
+    } catch (e) {
+      setCfgMsg(e?.response?.data?.message || 'Error al guardar');
+    }
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const anio = new Date(hasta).getFullYear();
+        const data = await getPlanillaConfig(anio);
+        setCfgSummary({
+          anio,
+          ccss_obrero: Number(data?.ccss_obrero ?? 0.1034),
+          banco_popular_obrero: Number(data?.banco_popular_obrero ?? 0.01),
+          patronal_total: Number(data?.patronal_total ?? 0.2633),
+        });
+      } catch {
+        setCfgSummary({
+          anio: new Date(hasta).getFullYear(),
+          ccss_obrero: 0.1034,
+          banco_popular_obrero: 0.01,
+          patronal_total: 0.2633,
+        });
+      }
+    })();
+  }, [hasta]);
+
+  async function exportPDF() {
+    try {
+      const blob = await downloadPlanillaPdf({ periodo, desde: toISO(desde), hasta: toISO(hasta) });
+      const url = URL.createObjectURL(blob);
+      const w = window.open(url, '_blank');
+      if (!w) {
+        const a = document.createElement('a');
+        a.href = url; a.download = `planilla_${periodo}_${desde}_${hasta}.pdf`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (e) {
+      setError(e?.response?.data?.message || 'No se pudo generar el PDF');
+    }
+  }
+
+  return (
+    <div className="container py-4">
+      <div className="d-flex justify-content-between align-items-center mb-3">
+        <h2 className="mb-0">Planilla</h2>
+      </div>
+
+      <div className="card mb-3">
+        <div className="card-body">
+          <div className="row g-3">
+            <div className="col-12 col-md-2">
+              <label className="form-label">Período</label>
+              <select className="form-select" value={periodo} onChange={e => setPeriodo(e.target.value)}>
+                <option value="mensual">Mensual</option>
+                <option value="quincenal">Quincenal</option>
+                <option value="semanal">Semanal</option>
+              </select>
+            </div>
+            <div className="col-12 col-md-2">
+              <label className="form-label">Desde</label>
+              <input type="date" className="form-control" value={desde} max={todayISO()} onChange={e => setDesde(e.target.value)} />
+            </div>
+            <div className="col-12 col-md-2">
+              <label className="form-label">Hasta</label>
+              <input type="date" className="form-control" value={hasta} max={todayISO()} onChange={e => setHasta(e.target.value)} />
+            </div>
+            <div className="col-12 col-md-2">
+              <label className="form-label">Horas/mes</label>
+              <input type="number" className="form-control" value={horasMes} onChange={e => setHorasMes(Number(e.target.value) || 0)} />
+            </div>
+            <div className="col-12 col-md-2">
+              <label className="form-label">Tipo H.E.</label>
+              <select
+                className="form-select"
+                value={tipoHE}
+                onChange={(e)=>{
+                  const v = e.target.value;
+                  setTipoHE(v);
+                  const t = HE_TYPES.find(x=>x.key===v);
+                  if (t && t.factor!=null) setTasaHE(t.factor);
+                }}
+              >
+                {HE_TYPES.map(o => (
+                  <option key={o.key} value={o.key}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="col-12 col-md-2">
+              <label className="form-label">Porcentaje</label>
+              <div className="input-group">
+                <input
+                  type="number"
+                  step="0.1"
+                  min="1"
+                  className="form-control"
+                  value={tasaHE}
+                  onChange={e => setTasaHE(parseNum(e.target.value))}
+                  disabled={tipoHE !== 'personalizada'}
+                />
+                <span className="input-group-text">x</span>
+              </div>
+            </div>
+            <div className="col-12 col-md-2">
+              <label className="form-label">Base Renta</label>
+              <select className="form-select" value={rentaBase} onChange={e => setRentaBase(e.target.value)}>
+                <option value="Neto">Neto (Bruto - CCSS - BP)</option>
+                <option value="Bruto">Bruto</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="d-flex gap-2 mt-3">
+            <button className="btn btn-primary" onClick={doPreview} disabled={loading}>Previsualizar</button>
+            <button className="btn btn-outline-secondary" onClick={loadConfig}>Configurar tasas…</button>
+            {hasPerm('planilla_ver_RH') && (
+              <button className="btn btn-outline-primary" onClick={loadPersisted} disabled={loading}>Cargar persistidas</button>
+            )}
+            {hasPerm('planilla_generar_RH') && (
+              <button className="btn btn-success" onClick={doGenerar} disabled={loading || locked}>Generar planilla</button>
+            )}
+            {rowsDB.length > 0 && (
+              <button className="btn btn-outline-secondary" onClick={exportPDF} disabled={loading}>Exportar PDF</button>
+            )}
+            {hasPerm('planilla_cerrar_RH') && (
+              <button
+                className="btn btn-outline-danger"
+                onClick={async () => {
+                  try {
+                    await cerrarPlanillaRango({ periodo, fecha_inicio: toISO(desde), fecha_fin: toISO(hasta) });
+                    setLocked(true);
+                  } catch (e) { setError(e?.response?.data?.message || e.message); }
+                }}
+                disabled={locked}
+              >
+                Cerrar
+              </button>
+            )}
+          </div>
+
+          {error && <div className="alert alert-danger mt-3">{error}</div>}
+          {genMsg && <div className="alert alert-success mt-3">{genMsg}</div>}
+          {locked && <div className="alert alert-warning mt-3">Planilla cerrada para este rango. Edición deshabilitada.</div>}
+        </div>
+      </div>
+
+      {rowsPrev.length > 0 && (
+        <div className="card">
+          <div className="card-body">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <h5 className="mb-0">Previsualización (no persiste)</h5>
+              <div className="d-flex align-items-center gap-2">
+                <button className="btn btn-sm btn-outline-secondary" onClick={loadConfig} title="Editar tasas">Tasas %</button>
+              </div>
+            </div>
+            <div className="table-responsive">
+              <table className="table table-sm table-striped align-middle">
+                <thead>
+                  <tr>
+                    <th>Empleado</th>
+                    <th>Puesto</th>
+                    <th className="text-end">Salario mensual</th>
+                    <th className="text-end">Sueldo período</th>
+                    <th className="text-end">H.E. monto</th>
+                    <th className="text-end">Bono</th>
+                    <th className="text-end">Vac. pago</th>
+                    <th className="text-end">Permisos (sin goce)</th>
+                    <th className="text-end">Bruto</th>
+                    <th className="text-end">CCSS obrero</th>
+                    <th className="text-end">Banco Popular</th>
+                    <th className="text-end">Renta</th>
+                    <th className="text-end">Préstamo</th>
+                    <th className="text-end">Neto</th>
+                    <th className="text-end">Patronal</th>
+                    <th>Obs.</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rowsPrev.map((r) => (
+                    <tr key={r.idEmpleado}>
+                      <td>{r.nombre}</td>
+                      <td>{r.puesto}</td>
+                      <td className="text-end">{fmt(r.salario_mensual)}</td>
+                      <td className="text-end">{fmt(r.sueldo_periodo)}</td>
+                      <td className="text-end">{fmt(r.he_monto)}</td>
+                      <td className="text-end">{fmt(r.bono)}</td>
+                      <td className="text-end">{fmt(r.vac_pago)}</td>
+                      <td className="text-end">{fmt(r.permisos_sin_goce)}</td>
+                      <td className="text-end">{fmt(r.bruto)}</td>
+                      <td className="text-end">{fmt(r.ccss_obrero)}</td>
+                      <td className="text-end">{fmt(r.banco_popular)}</td>
+                      <td className="text-end">{fmt(r.renta)}</td>
+                      <td className="text-end">{fmt(r.prestamo || r.prestamo_monto || 0)}</td>
+                      <td className="text-end">{fmt(r.neto)}</td>
+                      <td className="text-end">{fmt(r.patronal)}</td>
+                      <td>{r.obs}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                {totalesPrev && (
+                  <tfoot>
+                    <tr>
+                      <th colSpan={8} className="text-end">Totales</th>
+                      <th className="text-end">{fmt(totalesPrev.totalBruto)}</th>
+                      <th className="text-end">{fmt(totalesPrev.totalObrero)}</th>
+                      <th className="text-end">{fmt(totalesPrev.totalBancoPopular || 0)}</th>
+                      <th className="text-end">{fmt(totalesPrev.totalRenta)}</th>
+                      <th className="text-end">{fmt(totalesPrev.totalPrestamo || 0)}</th>
+                      <th className="text-end">{fmt(totalesPrev.totalNeto)}</th>
+                      <th className="text-end">{fmt(totalesPrev.totalPatronal)}</th>
+                      <th></th>
+                    </tr>
+                    <tr>
+                      <th colSpan={14} className="text-end">Costo total empresa</th>
+                      <th className="text-end">{fmt(totalesPrev.costoTotalEmpresa)}</th>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {rowsDB.length > 0 && (
+        <div className="card mt-3">
+          <div className="card-body">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <h5 className="mb-0">Persistidas en BD</h5>
+              <div className="d-flex align-items-center gap-2">
+                {snapshot?.tasas && (
+                  <small className="text-muted">
+                    Tasas: CCSS {Math.round(snapshot.tasas.ccss_obrero * 10000) / 100}% | BP {Math.round(snapshot.tasas.banco_popular_obrero * 10000) / 100}% | Patronal {Math.round(snapshot.tasas.patronal_total * 10000) / 100}%
+                  </small>
+                )}
+                <button className="btn btn-sm btn-outline-secondary" onClick={loadConfig} title="Editar tasas">Tasas %</button>
+              </div>
+            </div>
+            <div className="table-responsive">
+              <table className="table table-sm table-striped align-middle">
+                <thead>
+                  <tr>
+                    <th>Empleado</th>
+                    <th>Puesto</th>
+                    <th className="text-end">Salario mensual</th>
+                    <th className="text-end">Sueldo período</th>
+                    <th className="text-end">H.E. monto</th>
+                    <th className="text-end">Bono</th>
+                    <th className="text-end">Vac. pago</th>
+                    <th className="text-end">Permisos (sin goce)</th>
+                    <th className="text-end">Bruto</th>
+                    <th className="text-end">CCSS obrero</th>
+                    <th className="text-end">Banco Popular</th>
+                    <th className="text-end">Renta</th>
+                    <th className="text-end">Neto</th>
+                    <th className="text-end">Patronal</th>
+                    <th>Obs.</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rowsDB.map((r) => {
+                    const he = Number(r.monto_horas_extras || r.horas_extras_monto || 0);
+                    const patronalRate = snapshot?.tasas?.patronal_total || 0;
+                    const patronal = Number(r.salario_bruto || 0) * Number(patronalRate);
+                    const obsPieces = [];
+                    if (r.incapacidades) obsPieces.push(`Inc: ${r.incapacidades}`);
+                    if (r.vacaciones) obsPieces.push(`Vac: ${r.vacaciones}`);
+                    return (
+                      <tr key={r.idPlanilla}>
+                        <td>{r.nombre}</td>
+                        <td>{r.nombre_puesto}</td>
+                        <td className="text-end">{fmt(r.salario_base || 0)}</td>
+                        <td className="text-end">{fmt(r.monto_horas_ordinarias || 0)}</td>
+                        <td className="text-end">
+                          <EditableCell
+                            value={he}
+                            disabled={locked}
+                            onSave={async (val, motivo) => {
+                              await overridePlanilla({
+                                periodo,
+                                fecha_inicio: toISO(desde),
+                                fecha_fin: toISO(hasta),
+                                idPlanilla: r.idPlanilla,
+                                campo: 'monto_horas_extras',
+                                valor: val,
+                                motivo,
+                              });
+                              await loadPersisted();
+                            }}
+                          />
+                        </td>
+                        <td className="text-end">
+                          <EditableCell
+                            value={r.monto_bono || 0}
+                            disabled={locked}
+                            onSave={async (val, motivo) => {
+                              await overridePlanilla({
+                                periodo,
+                                fecha_inicio: toISO(desde),
+                                fecha_fin: toISO(hasta),
+                                idPlanilla: r.idPlanilla,
+                                campo: 'monto_bono',
+                                valor: val,
+                                motivo,
+                              });
+                              await loadPersisted();
+                            }}
+                          />
+                        </td>
+                        <td className="text-end">-</td>
+                        <td className="text-end">-</td>
+                        <td className="text-end">{fmt(r.salario_bruto)}</td>
+                        <td className="text-end">{fmt(r.deduccion_ccss)}</td>
+                        <td className="text-end">{fmt(r.deduccion_bancopopular)}</td>
+                        <td className="text-end">{fmt(r.deduccion_renta)}</td>
+                        <td className="text-end">
+                          <EditableCell
+                            value={r.deduccion_prestamo || 0}
+                            disabled={locked}
+                            onSave={async (val, motivo) => {
+                              await overridePlanilla({
+                                periodo,
+                                fecha_inicio: toISO(desde),
+                                fecha_fin: toISO(hasta),
+                                idPlanilla: r.idPlanilla,
+                                campo: 'deduccion_prestamo',
+                                valor: val,
+                                motivo,
+                              });
+                              await loadPersisted();
+                            }}
+                          />
+                        </td>
+                        <td className="text-end">{fmt(r.monto_pagado)}</td>
+                        <td className="text-end">{fmt(patronal)}</td>
+                        <td>{obsPieces.join(' | ')}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cfgOpen && (
+        <div className="modal d-block" tabIndex="-1" style={{ background: 'rgba(0,0,0,0.4)' }}>
+          <div className="modal-dialog modal-lg modal-dialog-centered">
+            <div className="modal-content">
+              <div className="modal-header">
+                <h5 className="modal-title">Tasas del año {cfgAnio}</h5>
+                <button className="btn-close" onClick={() => setCfgOpen(false)}></button>
+              </div>
+              <div className="modal-body">
+                <div className="row g-3">
+                  <div className="col-12 col-md-4">
+                    <div className="card h-100">
+                      <div className="card-body">
+                        <h6 className="card-title">Aportes Obrero</h6>
+                        <div className="mb-2">
+                          <label className="form-label">CCSS (%)</label>
+                          <input
+                            type="number"
+                            step="0.0001"
+                            className="form-control"
+                            value={(cfg.ccss_obrero * 100).toFixed(4)}
+                            onChange={(e) => setCfg((s) => ({ ...s, ccss_obrero: Number(e.target.value) / 100 }))}
+                          />
+                        </div>
+                        <div className="mb-2">
+                          <label className="form-label">Banco Popular (%)</label>
+                          <input
+                            type="number"
+                            step="0.0001"
+                            className="form-control"
+                            value={(cfg.banco_popular_obrero * 100).toFixed(4)}
+                            onChange={(e) => setCfg((s) => ({ ...s, banco_popular_obrero: Number(e.target.value) / 100 }))}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="col-12 col-md-4">
+                    <div className="card h-100">
+                      <div className="card-body">
+                        <h6 className="card-title">Aporte Patronal</h6>
+                        <div className="mb-2">
+                          <label className="form-label">Total Patronal (%)</label>
+                          <input
+                            type="number"
+                            step="0.0001"
+                            className="form-control"
+                            value={(cfg.patronal_total * 100).toFixed(4)}
+                            onChange={(e) => setCfg((s) => ({ ...s, patronal_total: Number(e.target.value) / 100 }))}
+                          />
+                        </div>
+                        <small className="text-muted">Usado para costo total empresa.</small>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="col-12 col-md-4">
+                    <div className="card h-100">
+                      <div className="card-body">
+                        <h6 className="card-title">Renta (desde BD)</h6>
+                        <p className="mb-1">
+                          Los tramos del impuesto sobre la renta se leen de <code>dbo.Renta_Tramo</code> según la fecha fin del período.
+                        </p>
+                        <p className="text-muted mb-0">No se editan aquí.</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                {cfgMsg && <div className="alert alert-info mt-3">{cfgMsg}</div>}
+              </div>
+              <div className="modal-footer">
+                <button className="btn btn-secondary" onClick={() => setCfgOpen(false)}>Cerrar</button>
+                <button className="btn btn-primary" onClick={saveConfig}>Guardar</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

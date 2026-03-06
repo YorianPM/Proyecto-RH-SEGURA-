@@ -1,0 +1,1084 @@
+const { sql, getPool } = require('../db');
+const { calcularEmpleadoPeriodo, DEFAULTS, toPeriodoDesdeMensual, aportesSociales, rentaPeriodoCR2025, rentaPeriodo, ajustarSueldoPorIncapacidades, diasSolapados, buildTramosMensualesFromDb } = require('../utils/payroll');
+// Controlador de planillas: genera previsualizaciones, configuraciones y cierres oficiales.
+
+// Helper para armar nombre completo
+function nombreCompleto(e) {
+  return [e.nombre, e.apellido1, e.apellido2].filter(Boolean).join(' ');
+}
+
+// Consolida horas extra aprobadas en el rango y aplica factor correspondiente.
+async function buildHorasExtrasMap(pool, { desde, hasta, tasaHE }) {
+  const tasa = Number(tasaHE) || DEFAULTS.tasaHoraExtra;
+  const baseFrom = `
+    FROM dbo.Horas_Extras he
+    JOIN dbo.Control_de_Asistencia c ON c.idControlAsistencia = he.idControlAsistencia
+    JOIN dbo.Empleados e ON e.idEmpleado = c.idEmpleado
+    WHERE he.decision = 'Aprobado'
+      AND TRY_CONVERT(date, he.fecha, 103) >= @desde
+      AND TRY_CONVERT(date, he.fecha, 103) <= @hasta
+    GROUP BY e.idEmpleado;
+  `;
+  try {
+    const heQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .input('tasa', sql.Decimal(10, 2), tasa)
+      .query(`
+        SELECT e.idEmpleado,
+               SUM(he.horas_extras) AS horas,
+               SUM(he.horas_extras * COALESCE(NULLIF(he.factor, 0), @tasa)) AS ponderadas
+        ${baseFrom}
+      `);
+    return new Map(
+      heQ.recordset.map(r => [r.idEmpleado, { horas: Number(r.horas || 0), ponderadas: Number(r.ponderadas || 0) }])
+    );
+  } catch (err) {
+    console.warn('Factor columna no disponible, usando tasa global para horas extra:', err.message);
+    const heQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT e.idEmpleado, SUM(he.horas_extras) AS horas
+        ${baseFrom}
+      `);
+    return new Map(
+      heQ.recordset.map(r => {
+        const horas = Number(r.horas || 0);
+        return [r.idEmpleado, { horas, ponderadas: horas * tasa }];
+      })
+    );
+  }
+}
+
+// Normaliza fechas aceptando YYYY-MM-DD o DD/MM/YYYY o DD-MM-YYYY
+function toISODate(input) {
+  if (!input) return null;
+  if (input instanceof Date) return input.toISOString().slice(0, 10);
+  const s = String(input).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  let m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d.toISOString().slice(0,10);
+  return null;
+}
+
+// Convierte 'HH:MM:SS' a horas decimales
+function timeToHours(t) {
+  if (!t) return 0;
+  try {
+    const s = String(t);
+    const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (!m) return 0;
+    const h = parseInt(m[1], 10) || 0;
+    const mi = parseInt(m[2], 10) || 0;
+    const se = parseInt(m[3] || '0', 10) || 0;
+    return h + (mi / 60) + (se / 3600);
+  } catch (_) { return 0; }
+}
+
+// GET /api/planilla/preview?periodo=mensual|quincenal|semanal&desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+// Opcionales: horasMes=208&tasaHE=1.5&rentaBase=neto_ccss|bruto
+// GET /api/planilla/preview -> calcula planilla tradicional usando utilidades base.
+exports.preview = async (req, res, next) => {
+  try {
+    const periodo = (req.query.periodo || 'mensual').toLowerCase();
+    const desde = toISODate(req.query.desde);
+    const hasta = toISODate(req.query.hasta);
+    const horasMes = Number(req.query.horasMes || DEFAULTS.horasMes);
+    const tasaHE = Number(req.query.tasaHE || DEFAULTS.tasaHoraExtra);
+    const rentaBase = (req.query.rentaBase || DEFAULTS.rentaBase);
+    const bancoPopularRate = req.query.bancoPopularRate !== undefined ? Number(req.query.bancoPopularRate) : 0.01;
+
+    if (!desde || !hasta) {
+      const e = new Error('ParÃ¡metros requeridos: desde, hasta');
+      e.status = 400; throw e;
+    }
+
+    const pool = await getPool();
+
+    // 1) Empleados activos con salario (desde Puestos)
+    const empQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .query(`
+      SELECT e.idEmpleado, e.nombre, e.apellido1, e.apellido2,
+             p.nombre_puesto, p.salario_base
+      FROM dbo.Empleados e
+      JOIN dbo.Puestos p ON p.idPuesto = e.idPuesto
+      WHERE e.estado = 1
+        AND CAST(e.fecha_ingreso AS date) <= @desde
+      ORDER BY e.idEmpleado ASC;
+    `);
+
+    const empleados = empQ.recordset;
+    if (!empleados.length) return res.json({ ok: true, data: [], meta: { totalBruto: 0, totalNeto: 0 } });
+
+    // 2) Horas extra aprobadas por empleado en el rango
+    const horasPorEmp = await buildHorasExtrasMap(pool, { desde, hasta, tasaHE });
+
+    // 3) Incapacidades y vacaciones dentro del rango
+    const incQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT i.idEmpleado, i.fecha_inicio, i.fecha_fin, i.estado, t.concepto
+        FROM dbo.Incapacidad i
+        JOIN dbo.Tipo_Incapacidad t ON t.idTipo_Incapacidad=i.idTipo_Incapacidad
+        WHERE i.estado = 1
+          AND i.fecha_inicio <= @hasta AND i.fecha_fin >= @desde;
+      `);
+    const incByEmp = new Map();
+    for (const r of incQ.recordset) {
+      if (!incByEmp.has(r.idEmpleado)) incByEmp.set(r.idEmpleado, []);
+      incByEmp.get(r.idEmpleado).push(r);
+    }
+
+    const vacQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT v.idEmpleado, s.fecha_inicio_vac, s.fecha_fin_vac, s.decision_administracion, s.pago
+        FROM dbo.Solicitudes s
+        JOIN dbo.Vacaciones v ON v.idVacaciones=s.idVacaciones
+        WHERE s.decision_administracion='Aprobado'
+          AND s.fecha_inicio_vac <= @hasta AND s.fecha_fin_vac >= @desde;
+      `);
+    const vacByEmp = new Map();
+    for (const r of vacQ.recordset) {
+      if (!vacByEmp.has(r.idEmpleado)) vacByEmp.set(r.idEmpleado, []);
+      vacByEmp.get(r.idEmpleado).push(r);
+    }
+
+    // Permisos SIN goce dentro del rango (decision Aprobado)
+    const permQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT p.idEmpleado, p.fecha_inicio, p.fecha_fin, p.cantidad_horas
+        FROM dbo.Permisos p
+        WHERE p.decision='Aprobado'
+          AND (p.derecho_pago IS NULL OR p.derecho_pago IN ('No','NO','no'))
+          AND p.fecha_inicio <= @hasta AND p.fecha_fin >= @desde;
+      `);
+    const permByEmp = new Map();
+    for (const r of permQ.recordset) {
+      if (!permByEmp.has(r.idEmpleado)) permByEmp.set(r.idEmpleado, []);
+      permByEmp.get(r.idEmpleado).push(r);
+    }
+
+    
+
+    // 3a) Tramos de renta desde BD, segÃºn fecha de hasta
+    const tramosQ = await pool.request()
+      .input('h', sql.Date, hasta)
+      .query(`
+        SELECT idRenta_tramo, vigencia_desde, vigencia_hasta, monto_min, monto_max, tasa_pct
+        FROM dbo.Renta_Tramo
+        WHERE (vigencia_desde IS NULL OR vigencia_desde <= @h)
+          AND (vigencia_hasta IS NULL OR vigencia_hasta >= @h)
+        ORDER BY monto_min ASC;
+      `);
+    const tramosDb = buildTramosMensualesFromDb(tramosQ.recordset || []);
+
+    // (permByEmp ya fue calculado arriba)
+
+    // 4) Calcular por empleado
+    const filas = [];
+    let totalBruto = 0, totalObrero = 0, totalRenta = 0, totalOtras = 0, totalNeto = 0, totalPatronal = 0, totalBancoPopular = 0;
+
+    for (const e of empleados) {
+      const heStats = horasPorEmp.get(e.idEmpleado) || { horas: 0, ponderadas: 0 };
+      const horasExtras = heStats.horas;
+      const salarioMensual = Number(e.salario_base);
+      const baseCalc = calcularEmpleadoPeriodo({
+        salarioMensual,
+        periodo,
+        horasExtras,
+        horasExtrasFactorizadas: heStats.ponderadas,
+        horasMes,
+        tasaHoraExtra: tasaHE,
+        rentaBase,
+      });
+
+      const aj = ajustarSueldoPorIncapacidades({
+        sueldoPeriodo: baseCalc.sueldoPeriodo,
+        salarioMensual,
+        periodo,
+        desde,
+        hasta,
+        incapacidades: incByEmp.get(e.idEmpleado) || [],
+      });
+
+      const vacs = vacByEmp.get(e.idEmpleado) || [];
+      let vacPago = 0; let vacDias = 0;
+      for (const v of vacs) {
+        const d = diasSolapados(desde, hasta, v.fecha_inicio_vac, v.fecha_fin_vac);
+        if (d > 0) { vacDias += d; vacPago += Number(v.pago || 0); }
+      }
+
+      const extrasPeriodo = baseCalc.extrasPeriodo;
+      // Descuento por permisos sin goce
+      let horasPerm = 0;
+      for (const p of (permByEmp.get(e.idEmpleado) || [])) {
+        const d = diasSolapados(desde, hasta, p.fecha_inicio, p.fecha_fin);
+        if (d <= 0) continue;
+        const h = timeToHours(p.cantidad_horas);
+        if (h > 0) horasPerm += h; else horasPerm += d * (horasMes / 30);
+      }
+      const salarioHora = salarioMensual / Number(horasMes || DEFAULTS.horasMes);
+      const descPerm = round2(horasPerm * salarioHora);
+      const bruto = round2(Math.max(0, aj.sueldoAjustado - descPerm) + extrasPeriodo + vacPago);
+      const aportes = aportesSociales(bruto, {});
+      const bancoPopular = round2(bruto * Number(bancoPopularRate));
+      const ccssObrero = round2(Math.max(aportes.obrero - bancoPopular, 0));
+      const baseRenta = (rentaBase === 'bruto') ? bruto : Math.max(0, bruto - (ccssObrero + bancoPopular));
+      const renta = rentaPeriodo(baseRenta, periodo, tramosDb);
+      const neto = round2(bruto - ccssObrero - bancoPopular - renta);
+      const patronal = aportes.patronal;
+
+      totalBruto += bruto;
+      totalObrero += ccssObrero;
+      totalRenta += renta;
+      totalNeto += neto;
+      totalPatronal += patronal;
+      totalBancoPopular += bancoPopular;
+
+      filas.push({
+        idEmpleado: e.idEmpleado,
+        nombre: nombreCompleto(e),
+        puesto: e.nombre_puesto,
+        salario_mensual: salarioMensual,
+        sueldo_periodo: aj.sueldoAjustado,
+        horas_extras: baseCalc.horasExtras,
+        extras_monto: extrasPeriodo,
+        bono: 0,
+        bruto: bruto,
+        ccss_obrero: ccssObrero,
+        banco_popular: bancoPopular,
+        renta_base: rentaBase,
+        renta: renta,
+        credito_fiscal: 0,
+        otras_deducciones: descPerm,
+        neto: neto,
+        ccss_patronal: patronal,
+        incap_resumen: aj.resumen,
+        vac_dias: vacDias,
+        vac_pago: round2(vacPago),
+        permisos_descuento_horas: round2(horasPerm),
+        permisos_descuento_monto: descPerm,
+      });
+    }
+
+    const meta = {
+      periodo,
+      desde,
+      hasta,
+      horasMes,
+      tasaHE,
+      rentaBase,
+      totalBruto: Number(totalBruto.toFixed(2)),
+      totalObrero: Number(totalObrero.toFixed(2)),
+      totalRenta: Number(totalRenta.toFixed(2)),
+      totalOtras: Number(totalOtras.toFixed(2)),
+      totalNeto: Number(totalNeto.toFixed(2)),
+      totalPatronal: Number(totalPatronal.toFixed(2)),
+      costoTotalEmpresa: Number((totalBruto + totalPatronal).toFixed(2)),
+      totalBancoPopular: Number(totalBancoPopular.toFixed(2)),
+    };
+
+    res.json({ ok: true, data: filas, meta });
+  } catch (err) { next(err); }
+};
+
+// GET /api/planilla/preview-v2  -> DevoluciÃ³n dinÃ¡mica (ingresos/deducciones)
+// Query: periodo, desde, hasta, horasMes?, tasaHE?, rentaBase?, bancoPopularRate?=0.01
+// GET /api/planilla/preview-v2 -> version con capacidad de excluir conceptos manualmente.
+exports.previewV2 = async (req, res, next) => {
+  try {
+    const periodo = (req.query.periodo || 'mensual').toLowerCase();
+    const desde = toISODate(req.query.desde);
+    const hasta = toISODate(req.query.hasta);
+    const horasMes = Number(req.query.horasMes || DEFAULTS.horasMes);
+    const tasaHE = Number(req.query.tasaHE || DEFAULTS.tasaHoraExtra);
+    const rentaBase = (req.query.rentaBase || DEFAULTS.rentaBase);
+    const bancoPopularRate = req.query.bancoPopularRate !== undefined ? Number(req.query.bancoPopularRate) : 0.01;
+
+    if (!desde || !hasta) { const e=new Error('ParÃ¡metros requeridos: desde, hasta'); e.status=400; throw e; }
+
+    const pool = await getPool();
+    // Empleados activos
+    const empQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .query(`
+      SELECT e.idEmpleado, e.nombre, e.apellido1, e.apellido2, p.nombre_puesto, p.salario_base
+      FROM dbo.Empleados e
+      JOIN dbo.Puestos p ON p.idPuesto=e.idPuesto
+      WHERE e.estado=1
+        AND CAST(e.fecha_ingreso AS date) <= @desde
+      ORDER BY e.idEmpleado ASC;
+    `);
+    const empleados = empQ.recordset;
+    if (!empleados.length) return res.json({ ok:true, data:[], meta:{ totalBruto:0, totalNeto:0 } });
+
+    // Horas extra aprobadas
+    const horasPorEmp = await buildHorasExtrasMap(pool, { desde, hasta, tasaHE });
+
+    // Incapacidades
+    const incQ = await pool.request().input('desde', sql.Date, desde).input('hasta', sql.Date, hasta).query(`
+      SELECT i.idEmpleado, i.fecha_inicio, i.fecha_fin, i.estado, t.concepto
+      FROM dbo.Incapacidad i
+      JOIN dbo.Tipo_Incapacidad t ON t.idTipo_Incapacidad=i.idTipo_Incapacidad
+      WHERE i.estado = 1 AND i.fecha_inicio <= @hasta AND i.fecha_fin >= @desde;
+    `);
+    const incByEmp = new Map();
+    for (const r of incQ.recordset) { if (!incByEmp.has(r.idEmpleado)) incByEmp.set(r.idEmpleado, []); incByEmp.get(r.idEmpleado).push(r); }
+
+    // Vacaciones aprobadas con pago
+    const vacQ = await pool.request().input('desde', sql.Date, desde).input('hasta', sql.Date, hasta).query(`
+      SELECT v.idEmpleado, s.fecha_inicio_vac, s.fecha_fin_vac, s.decision_administracion, s.pago
+      FROM dbo.Solicitudes s
+      JOIN dbo.Vacaciones v ON v.idVacaciones=s.idVacaciones
+      WHERE s.decision_administracion='Aprobado'
+        AND s.fecha_inicio_vac <= @hasta AND s.fecha_fin_vac >= @desde;
+    `);
+    const vacByEmp = new Map();
+    for (const r of vacQ.recordset) { if (!vacByEmp.has(r.idEmpleado)) vacByEmp.set(r.idEmpleado, []); vacByEmp.get(r.idEmpleado).push(r); }
+
+    // Permisos sin goce
+    const permQ = await pool.request().input('desde', sql.Date, desde).input('hasta', sql.Date, hasta).query(`
+      SELECT p.idEmpleado, p.fecha_inicio, p.fecha_fin, p.cantidad_horas, p.derecho_pago
+      FROM dbo.Permisos p
+      WHERE p.decision='Aprobado'
+        AND (p.derecho_pago IS NULL OR p.derecho_pago IN ('No','NO','no'))
+        AND p.fecha_inicio <= @hasta AND p.fecha_fin >= @desde;
+    `);
+    const permByEmp = new Map();
+    for (const r of permQ.recordset) { if (!permByEmp.has(r.idEmpleado)) permByEmp.set(r.idEmpleado, []); permByEmp.get(r.idEmpleado).push(r); }
+
+    // Tramos renta de BD
+    const tramosQ = await pool.request().input('h', sql.Date, hasta).query(`
+      SELECT idRenta_tramo, vigencia_desde, vigencia_hasta, monto_min, monto_max, tasa_pct
+      FROM dbo.Renta_Tramo
+      WHERE (vigencia_desde IS NULL OR vigencia_desde <= @h)
+        AND (vigencia_hasta IS NULL OR vigencia_hasta >= @h)
+      ORDER BY monto_min ASC;
+    `);
+    const tramosDb = buildTramosMensualesFromDb(tramosQ.recordset || []);
+
+    // CÃ¡lculo por empleado
+    const filas = [];
+    let totalBruto=0, totalObrero=0, totalBancoPopular=0, totalRenta=0, totalNeto=0, totalPatronal=0;
+
+    for (const e of empleados) {
+      const heStats = horasPorEmp.get(e.idEmpleado) || { horas: 0, ponderadas: 0 };
+      const horasExtras = heStats.horas;
+      const salarioMensual = Number(e.salario_base);
+      const baseCalc = calcularEmpleadoPeriodo({
+        salarioMensual,
+        periodo,
+        horasExtras,
+        horasExtrasFactorizadas: heStats.ponderadas,
+        horasMes,
+        tasaHoraExtra: tasaHE,
+        rentaBase,
+      });
+
+      const aj = ajustarSueldoPorIncapacidades({
+        sueldoPeriodo: baseCalc.sueldoPeriodo,
+        salarioMensual,
+        periodo,
+        desde,
+        hasta,
+        incapacidades: incByEmp.get(e.idEmpleado) || [],
+      });
+
+      // Vacaciones
+      let vacPago = 0; let vacDias = 0;
+      for (const v of (vacByEmp.get(e.idEmpleado) || [])) {
+        const d = diasSolapados(desde, hasta, v.fecha_inicio_vac, v.fecha_fin_vac);
+        if (d > 0) { vacDias += d; vacPago += Number(v.pago || 0); }
+      }
+
+      // Permisos sin goce
+      let horasPerm = 0;
+      for (const p of (permByEmp.get(e.idEmpleado) || [])) {
+        const d = diasSolapados(desde, hasta, p.fecha_inicio, p.fecha_fin);
+        if (d <= 0) continue;
+        const h = timeToHours(p.cantidad_horas);
+        horasPerm += (h > 0) ? h : (d * (horasMes / 30));
+      }
+      const salarioHora = Number(salarioMensual) / Number(horasMes || DEFAULTS.horasMes);
+      const descPerm = Math.round(horasPerm * salarioHora * 100) / 100;
+
+      // Bruto y aportes
+      const bruto = Math.round((Math.max(0, aj.sueldoAjustado - descPerm) + baseCalc.extrasPeriodo + vacPago) * 100) / 100;
+      const aportes = aportesSociales(bruto, {});
+      const bancoPopular = Math.round(bruto * Number(bancoPopularRate) * 100) / 100;
+      const ccssObrero = Math.max(aportes.obrero - bancoPopular, 0);
+      const baseRenta = (rentaBase === 'bruto') ? bruto : Math.max(0, bruto - (ccssObrero + bancoPopular));
+      const renta = rentaPeriodo(baseRenta, periodo, tramosDb);
+      const totalDedu = Math.round((ccssObrero + bancoPopular + renta + descPerm) * 100) / 100;
+      const neto = Math.round((bruto - totalDedu) * 100) / 100;
+
+      // Armar ingresos/deducciones
+      const ingresos = [
+        { key:'sueldo', label:'Sueldo perÃ­odo', amount: aj.sueldoAjustado },
+      ];
+      if (baseCalc.horasExtras > 0) ingresos.push({ key:'horas_extra', label:`Horas Extra (${baseCalc.horasExtras}h)`, amount: baseCalc.extrasPeriodo });
+      if (vacPago > 0) ingresos.push({ key:'vacaciones', label:'Vacaciones pagadas', amount: Math.round(vacPago * 100) / 100 });
+      // Bono (0 en preview por defecto)
+      // ingresos.push({ key:'bono', label:'Bono', amount: 0 });
+
+      const deducciones = [];
+      if (descPerm > 0) deducciones.push({ key:'permisos', label:'Permisos sin goce', amount: descPerm });
+      if (ccssObrero > 0) deducciones.push({ key:'ccss', label:'CCSS obrero', amount: Math.round(ccssObrero * 100) / 100 });
+      if (bancoPopular > 0) deducciones.push({ key:'banco_popular', label:'Banco Popular', amount: bancoPopular });
+      if (renta > 0) deducciones.push({ key:'renta', label:'Impuesto Renta', amount: renta });
+
+      totalBruto += bruto; totalObrero += ccssObrero; totalBancoPopular += bancoPopular; totalRenta += renta; totalNeto += neto; totalPatronal += aportes.patronal;
+
+      filas.push({
+        idEmpleado: e.idEmpleado,
+        nombre: nombreCompleto(e),
+        puesto: e.nombre_puesto,
+        salario_mensual: Number(salarioMensual),
+        ingresos,
+        deducciones,
+        totales: { bruto, deducciones: totalDedu, neto },
+        patronal: { ccss: aportes.patronal },
+        notas: { incapacidad: aj.resumen || '', vac_dias: vacDias, permisos_horas: Math.round(horasPerm * 100) / 100 },
+      });
+    }
+
+    const meta = {
+      periodo, desde, hasta, horasMes, tasaHE, rentaBase,
+      totalBruto: Number(totalBruto.toFixed(2)),
+      totalObrero: Number(totalObrero.toFixed(2)),
+      totalBancoPopular: Number(totalBancoPopular.toFixed(2)),
+      totalRenta: Number(totalRenta.toFixed(2)),
+      totalNeto: Number(totalNeto.toFixed(2)),
+      totalPatronal: Number(totalPatronal.toFixed(2)),
+      costoTotalEmpresa: Number((totalBruto + totalPatronal).toFixed(2)),
+    };
+
+    res.json({ ok:true, data: filas, meta });
+  } catch (err) { next(err); }
+};
+
+function round2(n){ return Math.round(Number(n)*100)/100; }
+
+/* ===================== Archivos de Config/Lock/Snapshot ===================== */
+// Se importan perezosamente para evitar fallas si no existen en entornos antiguos
+const { PERIOD_FACTORS } = require('../utils/payroll');
+const { configPath, readJSONSafe, writeJSON, isLocked, createLock, saveSnapshot, readSnapshot } = require('../services/planillaFiles');
+
+const DEFAULT_TASAS = { ccss_obrero:0.1034, banco_popular_obrero:0.01, patronal_total:0.2633 };
+
+function getTasasByYear(year){
+  const p = configPath(String(year));
+  const cfg = readJSONSafe(p, null);
+  if (!cfg) return { ...DEFAULT_TASAS };
+  const t = { ...DEFAULT_TASAS };
+  if (typeof cfg.ccss_obrero === 'number') t.ccss_obrero = cfg.ccss_obrero;
+  if (typeof cfg.banco_popular_obrero === 'number') t.banco_popular_obrero = cfg.banco_popular_obrero;
+  if (typeof cfg.patronal_total === 'number') t.patronal_total = cfg.patronal_total;
+  return t;
+}
+
+async function cargarTramos(pool, hasta){
+  const tramosQ = await pool.request()
+    .input('h', sql.Date, hasta)
+    .query(`
+      SELECT idRenta_tramo, vigencia_desde, vigencia_hasta, monto_min, monto_max, tasa_pct
+      FROM dbo.Renta_Tramo
+      WHERE (vigencia_desde IS NULL OR vigencia_desde <= @h)
+        AND (vigencia_hasta IS NULL OR vigencia_hasta >= @h)
+      ORDER BY monto_min ASC;
+    `);
+  const rows = tramosQ.recordset || [];
+  const tramosMensuales = buildTramosMensualesFromDb(rows);
+  return { rows, tramosMensuales };
+}
+
+function ppm(periodo){
+  const p = String(periodo||'mensual').toLowerCase();
+  return PERIOD_FACTORS[p] || 1;
+}
+
+function tramoDominanteId(baseMensual, tramosRows){
+  let id = null;
+  for (const r of (tramosRows||[])){
+    const min = Number(r.monto_min||0);
+    const max = (r.monto_max==null)? Infinity : Number(r.monto_max);
+    if (baseMensual >= min && baseMensual < max){ id = r.idRenta_tramo; break; }
+  }
+  if (id==null && tramosRows && tramosRows.length) id = tramosRows[tramosRows.length-1].idRenta_tramo;
+  return id||0;
+}
+
+function buildObs({aj, vacDias, horasPerm}){
+  const bits = [];
+  if (aj?.resumen) bits.push(`Inc: ${aj.resumen}`);
+  if (vacDias>0) bits.push(`Vac: ${vacDias}d`);
+  if (horasPerm>0) bits.push(`Perm: ${Math.round(Number(horasPerm)*100)/100}h`);
+  return bits.join(' | ');
+}
+
+async function calcularPlanillaFilas({ pool, periodo, desde, hasta, horasMes, tasaHE, baseRentaSel, bonosMap }){
+  const empQ = await pool.request()
+    .input('desde', sql.Date, desde)
+    .query(`
+    SELECT e.idEmpleado, e.nombre, e.apellido1, e.apellido2,
+           p.nombre_puesto, p.salario_base
+    FROM dbo.Empleados e
+    JOIN dbo.Puestos p ON p.idPuesto = e.idPuesto
+    WHERE e.estado = 1
+      AND CAST(e.fecha_ingreso AS date) <= @desde
+    ORDER BY e.idEmpleado ASC;
+  `);
+  const empleados = empQ.recordset || [];
+  if (!empleados.length) return { filas: [], tot: { totalBruto:0, totalNeto:0, totalObrero:0, totalBancoPopular:0, totalRenta:0, totalPatronal:0 } };
+
+  const horasPorEmp = await buildHorasExtrasMap(pool, { desde, hasta, tasaHE });
+
+  const incQ = await pool.request().input('desde', sql.Date, desde).input('hasta', sql.Date, hasta).query(`
+    SELECT i.idEmpleado, i.fecha_inicio, i.fecha_fin, i.estado, t.concepto
+    FROM dbo.Incapacidad i
+    JOIN dbo.Tipo_Incapacidad t ON t.idTipo_Incapacidad=i.idTipo_Incapacidad
+    WHERE i.estado = 1 AND i.fecha_inicio <= @hasta AND i.fecha_fin >= @desde;
+  `);
+  const incByEmp = new Map();
+  for (const r of incQ.recordset) { if (!incByEmp.has(r.idEmpleado)) incByEmp.set(r.idEmpleado, []); incByEmp.get(r.idEmpleado).push(r); }
+
+  const vacQ = await pool.request().input('desde', sql.Date, desde).input('hasta', sql.Date, hasta).query(`
+    SELECT v.idEmpleado, s.fecha_inicio_vac, s.fecha_fin_vac, s.decision_administracion, s.pago
+    FROM dbo.Solicitudes s
+    JOIN dbo.Vacaciones v ON v.idVacaciones=s.idVacaciones
+    WHERE s.decision_administracion='Aprobado'
+      AND s.fecha_inicio_vac <= @hasta AND s.fecha_fin_vac >= @desde;
+  `);
+  const vacByEmp = new Map();
+  for (const r of vacQ.recordset) { if (!vacByEmp.has(r.idEmpleado)) vacByEmp.set(r.idEmpleado, []); vacByEmp.get(r.idEmpleado).push(r); }
+
+  const permQ = await pool.request().input('desde', sql.Date, desde).input('hasta', sql.Date, hasta).query(`
+    SELECT p.idEmpleado, p.fecha_inicio, p.fecha_fin, p.cantidad_horas
+    FROM dbo.Permisos p
+    WHERE p.decision='Aprobado'
+      AND (p.derecho_pago IS NULL OR p.derecho_pago IN ('No','NO','no'))
+      AND p.fecha_inicio <= @hasta AND p.fecha_fin >= @desde;
+  `);
+  const permByEmp = new Map();
+  for (const r of permQ.recordset) { if (!permByEmp.has(r.idEmpleado)) permByEmp.set(r.idEmpleado, []); permByEmp.get(r.idEmpleado).push(r); }
+
+  const { rows: tramosRows, tramosMensuales } = await cargarTramos(pool, hasta);
+  const year = new Date(hasta).getFullYear();
+  const tasas = getTasasByYear(year);
+
+  const filas = [];
+  let totalBruto=0, totalObrero=0, totalBancoPopular=0, totalRenta=0, totalNeto=0, totalPatronal=0;
+
+  for (const e of empleados){
+    const salarioMensual = Number(e.salario_base);
+    const heStats = horasPorEmp.get(e.idEmpleado) || { horas: 0, ponderadas: 0 };
+    const horasExtras = heStats.horas;
+    const horasExtrasFactorizadas = heStats.ponderadas;
+    const salarioHora = salarioMensual / Number(horasMes || DEFAULTS.horasMes);
+    const sueldoPeriodo = toPeriodoDesdeMensual(salarioMensual, periodo);
+    const he_monto = round2(salarioHora * horasExtrasFactorizadas);
+    const bono = round2(Number(bonosMap.get(e.idEmpleado) || 0));
+
+    const aj = ajustarSueldoPorIncapacidades({
+      sueldoPeriodo,
+      salarioMensual,
+      periodo,
+      desde,
+      hasta,
+      incapacidades: incByEmp.get(e.idEmpleado) || [],
+    });
+
+    let vac_pago=0, vacDias=0;
+    for (const v of (vacByEmp.get(e.idEmpleado)||[])){
+      const d = diasSolapados(desde, hasta, v.fecha_inicio_vac, v.fecha_fin_vac);
+      if (d>0){ vacDias += d; vac_pago += Number(v.pago||0); }
+    }
+
+    let horasPerm=0;
+    for (const p of (permByEmp.get(e.idEmpleado)||[])){
+      const d = diasSolapados(desde, hasta, p.fecha_inicio, p.fecha_fin);
+      if (d<=0) continue;
+      const time = String(p.cantidad_horas||'');
+      const m = time.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+      if (m){
+        const h = (parseInt(m[1],10)||0) + (parseInt(m[2],10)||0)/60 + (parseInt(m[3]||'0',10)||0)/3600;
+        horasPerm += h;
+      } else {
+        horasPerm += d * (Number(horasMes||DEFAULTS.horasMes) / 30);
+      }
+    }
+    const permisos_sin_goce = round2(horasPerm * salarioHora);
+
+    const bruto = round2(Math.max(0, aj.sueldoAjustado - permisos_sin_goce) + he_monto + bono + vac_pago);
+    const ccss_obrero = round2(bruto * Number(tasas.ccss_obrero));
+    const banco_popular = round2(bruto * Number(tasas.banco_popular_obrero));
+    const baseRenta = baseRentaSel?.toLowerCase() === 'bruto' ? bruto : Math.max(0, bruto - ccss_obrero - banco_popular);
+    const renta = rentaPeriodo(baseRenta, periodo, tramosMensuales);
+    const neto = round2(bruto - ccss_obrero - banco_popular - renta);
+    const patronal = round2(bruto * Number(tasas.patronal_total));
+
+    totalBruto += bruto; totalObrero += ccss_obrero; totalBancoPopular += banco_popular; totalRenta += renta; totalNeto += neto; totalPatronal += patronal;
+
+    filas.push({
+      idEmpleado: e.idEmpleado,
+      nombre: [e.nombre, e.apellido1, e.apellido2].filter(Boolean).join(' '),
+      puesto: e.nombre_puesto,
+      salario_mensual: salarioMensual,
+      sueldo_periodo: round2(sueldoPeriodo),
+      he_monto,
+      bono,
+      vac_pago: round2(vac_pago),
+      permisos_sin_goce,
+      bruto,
+      ccss_obrero,
+      banco_popular,
+      renta,
+      neto,
+      patronal,
+      obs: buildObs({ aj, vacDias, horasPerm }),
+      _aux: { baseRenta, idRentaTramo: tramoDominanteId(baseRenta*ppm('mensual')/ppm(periodo), tramosRows), incapResumen: aj.resumen, vacDias },
+    });
+  }
+
+  const totales = {
+    totalBruto: round2(totalBruto),
+    totalObrero: round2(totalObrero),
+    totalBancoPopular: round2(totalBancoPopular),
+    totalRenta: round2(totalRenta),
+    totalNeto: round2(totalNeto),
+    totalPatronal: round2(totalPatronal),
+  };
+  const costo_total_empresa = round2(totalBruto + totalPatronal);
+  const snapshot = { tasas, tramos: (await cargarTramos(pool, hasta)).rows, params: { periodo, fecha_inicio: desde, fecha_fin: hasta, horas_mes: horasMes, tasa_he: tasaHE, base_renta: baseRentaSel } };
+  return { filas, totales, costo_total_empresa, snapshot };
+}
+
+// Endpoints de config y preview (POST)
+// GET /api/planilla/config/:anio -> devuelve configuracion persistida (tasas, etc.).
+exports.getConfig = async (req, res, next) => {
+  try {
+    const anio = String(req.params.anio);
+    const p = configPath(anio);
+    const j = readJSONSafe(p, null) || DEFAULT_TASAS;
+    res.json(j);
+  } catch (e) { next(e); }
+};
+
+// PUT /api/planilla/config/:anio -> actualiza las tasas/parametros globales.
+exports.putConfig = async (req, res, next) => {
+  try {
+    const anio = String(req.params.anio);
+    const body = req.body || {};
+    const cfg = {
+      ccss_obrero: Number(body.ccss_obrero ?? DEFAULT_TASAS.ccss_obrero),
+      banco_popular_obrero: Number(body.banco_popular_obrero ?? DEFAULT_TASAS.banco_popular_obrero),
+      patronal_total: Number(body.patronal_total ?? DEFAULT_TASAS.patronal_total),
+    };
+    writeJSON(configPath(anio), cfg);
+    res.json({ ok:true });
+  } catch (e) { next(e); }
+};
+
+// POST /api/planilla/preview-cr -> preview especifica Costa Rica (tramos CR).
+exports.previewCR = async (req, res, next) => {
+  try {
+    const periodo = (req.body.periodo || 'Mensual');
+    const desde = toISODate(req.body.fecha_inicio);
+    const hasta = toISODate(req.body.fecha_fin);
+    const horasMes = Number(req.body.horas_mes || DEFAULTS.horasMes);
+    const tasaHE = Number(req.body.tasa_he || DEFAULTS.tasaHoraExtra);
+    const baseRentaSel = (req.body.base_renta || 'Neto');
+    const bonos = Array.isArray(req.body.bonos) ? req.body.bonos : [];
+    const bonosMap = new Map(bonos.map(b => [Number(b.idEmpleado), Number(b.monto || 0)]));
+    if (!desde || !hasta) { const e=new Error('fecha_inicio y fecha_fin requeridos'); e.status=400; throw e; }
+
+    const pool = await getPool();
+    const { filas, totales, costo_total_empresa, snapshot } = await calcularPlanillaFilas({ pool, periodo: String(periodo).toLowerCase(), desde, hasta, horasMes, tasaHE, baseRentaSel: baseRentaSel.toLowerCase()==='bruto'?'bruto':'neto', bonosMap });
+    res.json({ filas, totales, costo_total_empresa, snapshot });
+  } catch (e) { next(e); }
+};
+
+// POST /api/planilla/generar
+// body: {
+//   periodo, desde, hasta,
+//   horasMes?, tasaHE?, rentaBase?, bancoPopularRate?=0.01,
+//   bonos?: [{idEmpleado,monto}],
+//   prestamos?: [{idEmpleado,monto}],
+//   reemplazar?: boolean // elimina registros previos del mismo rango/periodo
+// }
+// POST /api/planilla/generar -> materializa la planilla calculada e inserta detalle.
+exports.generar = async (req, res, next) => {
+  try {
+    const periodo = (req.body.periodo || 'mensual').toLowerCase();
+    const desde = toISODate(req.body?.desde);
+    const hasta = toISODate(req.body?.hasta);
+    if (!desde || !hasta) { const e = new Error('desde y hasta son requeridos'); e.status=400; throw e; }
+    const horasMes = Number(req.body.horasMes || DEFAULTS.horasMes);
+    const tasaHE = Number(req.body.tasaHE || DEFAULTS.tasaHoraExtra);
+    const rentaBase = (req.body.rentaBase || DEFAULTS.rentaBase);
+    const bancoPopularRate = req.body.bancoPopularRate !== undefined ? Number(req.body.bancoPopularRate) : 0.01;
+    const reemplazar = !!req.body.reemplazar;
+    let idRentaCreditoTipo = Number(req.body?.idRenta_credito_tipo);
+    let idRentaTramo = Number(req.body?.idRenta_tramo);
+    if (!idRentaCreditoTipo) idRentaCreditoTipo = 1;
+    if (!idRentaTramo) idRentaTramo = 1;
+
+    const bonosArr = Array.isArray(req.body.bonos) ? req.body.bonos : [];
+    const prestamosArr = Array.isArray(req.body.prestamos) ? req.body.prestamos : [];
+    const bonos = new Map(bonosArr.map(x => [Number(x.idEmpleado), Number(x.monto||0)]));
+    const prestamos = new Map(prestamosArr.map(x => [Number(x.idEmpleado), Number(x.monto||0)]));
+
+    const pool = await getPool();
+
+    if (reemplazar) {
+      await pool.request()
+        .input('desde', sql.Date, desde)
+        .input('hasta', sql.Date, hasta)
+        .input('periodo', sql.VarChar(20), periodo)
+        .query(`
+          DELETE FROM dbo.Planillas
+          WHERE CAST(fecha_inicio AS date) = @desde
+            AND CAST(fecha_fin AS date) = @hasta
+            AND periodo = @periodo;
+        `);
+    }
+
+    // Evitar duplicados cuando no se reemplaza
+    if (!reemplazar) {
+      const dupQ = await pool.request()
+        .input('desde', sql.Date, desde)
+        .input('hasta', sql.Date, hasta)
+        .input('periodo', sql.VarChar(20), periodo)
+        .query(`
+          SELECT idEmpleado FROM dbo.Planillas
+          WHERE CAST(fecha_inicio AS date) = @desde
+            AND CAST(fecha_fin AS date) = @hasta
+            AND periodo = @periodo;
+        `);
+      if (dupQ.recordset?.length) {
+        const e = new Error('Ya existe planilla para el periodo especificado. Use reemplazar=true para regenerar.');
+        e.status = 409; throw e;
+      }
+    }
+
+    const empQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .query(`
+      SELECT e.idEmpleado, e.nombre, e.apellido1, e.apellido2,
+             p.nombre_puesto, p.salario_base
+      FROM dbo.Empleados e
+      JOIN dbo.Puestos p ON p.idPuesto = e.idPuesto
+      WHERE e.estado = 1
+        AND CAST(e.fecha_ingreso AS date) <= @desde
+      ORDER BY e.idEmpleado ASC;
+    `);
+    const empleados = empQ.recordset;
+
+    const horasPorEmp = await buildHorasExtrasMap(pool, { desde, hasta, tasaHE });
+
+    // Incapacidades y solicitudes de vacaciones en el rango
+    const incQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT i.idEmpleado, i.fecha_inicio, i.fecha_fin, i.estado, t.concepto
+        FROM dbo.Incapacidad i
+        JOIN dbo.Tipo_Incapacidad t ON t.idTipo_Incapacidad=i.idTipo_Incapacidad
+        WHERE i.estado = 1
+          AND i.fecha_inicio <= @hasta AND i.fecha_fin >= @desde;
+      `);
+    const incByEmp = new Map();
+    for (const r of incQ.recordset) {
+      if (!incByEmp.has(r.idEmpleado)) incByEmp.set(r.idEmpleado, []);
+      incByEmp.get(r.idEmpleado).push(r);
+    }
+
+    const vacQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT v.idEmpleado, s.fecha_inicio_vac, s.fecha_fin_vac, s.decision_administracion, s.pago
+        FROM dbo.Solicitudes s
+        JOIN dbo.Vacaciones v ON v.idVacaciones=s.idVacaciones
+        WHERE s.decision_administracion='Aprobado'
+          AND s.fecha_inicio_vac <= @hasta AND s.fecha_fin_vac >= @desde;
+      `);
+    const vacByEmp = new Map();
+    for (const r of vacQ.recordset) {
+      if (!vacByEmp.has(r.idEmpleado)) vacByEmp.set(r.idEmpleado, []);
+      vacByEmp.get(r.idEmpleado).push(r);
+    }
+
+    // Tramos de renta BD (para generaciÃ³n)
+    const tramosQ = await pool.request()
+      .input('h', sql.Date, hasta)
+      .query(`
+        SELECT idRenta_tramo, vigencia_desde, vigencia_hasta, monto_min, monto_max, tasa_pct
+        FROM dbo.Renta_Tramo
+        WHERE (vigencia_desde IS NULL OR vigencia_desde <= @h)
+          AND (vigencia_hasta IS NULL OR vigencia_hasta >= @h)
+        ORDER BY monto_min ASC;
+      `);
+    const tramosDb = buildTramosMensualesFromDb(tramosQ.recordset || []);
+
+    // Permisos sin goce (Aprobado) en el rango para generación
+    const permQ = await pool.request()
+      .input('desde', sql.Date, desde)
+      .input('hasta', sql.Date, hasta)
+      .query(`
+        SELECT p.idEmpleado, p.fecha_inicio, p.fecha_fin, p.cantidad_horas
+        FROM dbo.Permisos p
+        WHERE p.decision='Aprobado'
+          AND (p.derecho_pago IS NULL OR p.derecho_pago IN ('No','NO','no'))
+          AND p.fecha_inicio <= @hasta AND p.fecha_fin >= @desde;
+      `);
+    const permByEmp = new Map();
+    for (const r of permQ.recordset) {
+      if (!permByEmp.has(r.idEmpleado)) permByEmp.set(r.idEmpleado, []);
+      permByEmp.get(r.idEmpleado).push(r);
+    }
+
+    const inserted = [];
+
+    for (const e of empleados) {
+      const heStats = horasPorEmp.get(e.idEmpleado) || { horas: 0, ponderadas: 0 };
+      const horasExtras = heStats.horas;
+      const horasExtrasFactorizadas = heStats.ponderadas;
+      const bono = round2(bonos.get(e.idEmpleado) || 0);
+      const prestamo = round2(prestamos.get(e.idEmpleado) || 0);
+
+      const salarioMensual = Number(e.salario_base);
+      const calc = calcularEmpleadoPeriodo({
+        salarioMensual,
+        periodo,
+        horasExtras,
+        horasExtrasFactorizadas,
+        horasMes,
+        tasaHoraExtra: tasaHE,
+        rentaBase,
+        otrasDeducciones: prestamo, // para que el neto ya descuente prÃ©stamo
+      });
+
+      // Recalcular por incapacidades y vacaciones
+      const aj = ajustarSueldoPorIncapacidades({
+        sueldoPeriodo: calc.sueldoPeriodo,
+        salarioMensual,
+        periodo,
+        desde,
+        hasta,
+        incapacidades: incByEmp.get(e.idEmpleado) || [],
+      });
+      let vacPago = 0; let vacDias = 0;
+      for (const v of (vacByEmp.get(e.idEmpleado) || [])) {
+        const d = diasSolapados(desde, hasta, v.fecha_inicio_vac, v.fecha_fin_vac);
+        if (d > 0) { vacDias += d; vacPago += Number(v.pago || 0); }
+      }
+
+      // Descuento por permisos sin goce (horas)
+      let horasPerm = 0;
+      for (const p of (permByEmp.get(e.idEmpleado) || [])) {
+        const overlapDays = diasSolapados(desde, hasta, p.fecha_inicio, p.fecha_fin);
+        if (overlapDays <= 0) continue;
+        const h = timeToHours(p.cantidad_horas);
+        if (h > 0) horasPerm += h; else horasPerm += overlapDays * (horasMes / 30);
+      }
+      const salarioHora = Number(e.salario_base) / Number(horasMes || DEFAULTS.horasMes);
+      const descPerm = round2(horasPerm * salarioHora);
+
+      // Recalcular aportes y renta considerando bono y pagos de vacaciones y permisos
+      const brutoConBono = round2(Math.max(0, aj.sueldoAjustado - descPerm) + calc.extrasPeriodo + bono + vacPago);
+      const aportes = aportesSociales(brutoConBono, {});
+      const baseRenta = (rentaBase === 'bruto') ? brutoConBono : Math.max(0, brutoConBono - aportes.obrero);
+      const renta = rentaPeriodo(baseRenta, periodo, tramosDb);
+
+      // Desglose obrero -> Banco Popular ~1% y resto CCSS
+      const bancoPopular = round2(brutoConBono * Number(bancoPopularRate));
+      const ccssObrero = round2(Math.max(aportes.obrero - bancoPopular, 0));
+      const neto = round2(brutoConBono - ccssObrero - bancoPopular - renta - prestamo);
+
+      const reqQ = pool.request()
+        .input('fecha_inicio', sql.Date, desde)
+        .input('fecha_fin', sql.Date, hasta)
+        .input('monto_horas_ordinarias', sql.Decimal(10,2), calc.sueldoPeriodo)
+        .input('monto_horas_extras', sql.Decimal(10,2), calc.extrasPeriodo)
+        .input('monto_bono', sql.Decimal(10,2), round2(bono + vacPago))
+        .input('salario_bruto', sql.Decimal(10,2), brutoConBono)
+        .input('deduccion_ccss', sql.Decimal(10,2), ccssObrero)
+        .input('deduccion_bancopopular', sql.Decimal(10,2), bancoPopular)
+        .input('deduccion_renta', sql.Decimal(10,2), renta)
+        .input('deduccion_prestamo', sql.Decimal(10,2), prestamo)
+        .input('monto_pagado', sql.Decimal(10,2), neto)
+        .input('periodo', sql.VarChar(20), periodo)
+        .input('idEmpleado', sql.Int, e.idEmpleado)
+        .input('incapacidades', sql.VarChar(200), aj.resumen || '')
+        .input('vacaciones', sql.VarChar(200), (vacDias>0? `${vacDias}d/Â¢${round2(vacPago)}`:''))
+        .input('horas_extras_monto', sql.Decimal(10,2), calc.extrasPeriodo)
+        .input('renta_credito_vigencia', sql.VarChar(45), '')
+        .input('valor_credito_fiscal', sql.Decimal(10,2), 0)
+        .input('idRenta_credito_tipo', sql.Int, idRentaCreditoTipo)
+        .input('idRenta_tramo', sql.Int, idRentaTramo);
+
+      const ins = await reqQ.query(`
+        INSERT INTO dbo.Planillas (
+          fecha_inicio, fecha_fin,
+          monto_horas_ordinarias, monto_horas_extras, monto_bono,
+          salario_bruto,
+          deduccion_ccss, deduccion_bancopopular, deduccion_renta, deduccion_prestamo,
+          monto_pagado,
+          periodo, idEmpleado,
+          incapacidades, vacaciones,
+          horas_extras_monto,
+          renta_credito_vigencia, valor_credito_fiscal,
+          idRenta_credito_tipo, idRenta_tramo
+        ) OUTPUT INSERTED.*
+        VALUES (
+          @fecha_inicio, @fecha_fin,
+          @monto_horas_ordinarias, @monto_horas_extras, @monto_bono,
+          @salario_bruto,
+          @deduccion_ccss, @deduccion_bancopopular, @deduccion_renta, @deduccion_prestamo,
+          @monto_pagado,
+          @periodo, @idEmpleado,
+          @incapacidades, @vacaciones,
+          @horas_extras_monto,
+          @renta_credito_vigencia, @valor_credito_fiscal,
+          @idRenta_credito_tipo, @idRenta_tramo
+        );
+      `);
+      inserted.push(ins.recordset[0]);
+    }
+
+    res.status(201).json({ ok:true, count: inserted.length, data: inserted });
+  } catch (err) { next(err); }
+};
+
+// GET /api/planilla?periodo=&desde=&hasta=
+// Lista planillas guardadas (con nombre de empleado y puesto)
+// GET /api/planilla -> lista planillas generadas con filtros basicos.
+exports.list = async (req, res, next) => {
+  try {
+    const periodo = req.query.periodo ? String(req.query.periodo).toLowerCase() : null;
+    const desde = toISODate(req.query.desde);
+    const hasta = toISODate(req.query.hasta);
+    const pool = await getPool();
+    const ps = pool.request();
+    const where = [];
+    if (periodo) { ps.input('periodo', sql.VarChar(20), periodo); where.push('p.periodo=@periodo'); }
+    if (desde) { ps.input('desde', sql.Date, desde); where.push('CAST(p.fecha_inicio AS date)=@desde'); }
+    if (hasta) { ps.input('hasta', sql.Date, hasta); where.push('CAST(p.fecha_fin AS date)=@hasta'); }
+    const whereSql = where.length ? ('WHERE ' + where.join(' AND ')) : '';
+    const { recordset } = await ps.query(`
+      SELECT p.*, (e.nombre+' '+e.apellido1+' '+ISNULL(e.apellido2,'')) AS nombre,
+             pu.nombre_puesto
+      FROM dbo.Planillas p
+      JOIN dbo.Empleados e ON e.idEmpleado=p.idEmpleado
+      JOIN dbo.Puestos pu ON pu.idPuesto=e.idPuesto
+      ${whereSql}
+      ORDER BY p.idPlanilla DESC;
+    `);
+    res.json({ ok:true, data: recordset });
+  } catch (err) { next(err); }
+};
+
+// PUT /api/planilla/:id  -> EdiciÃ³n bÃ¡sica y recÃ¡lculo
+// PUT /api/planilla/:id -> permite actualizar totales o metadata de planilla guardada.
+exports.update = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const body = req.body || {};
+    const allowed = ['monto_bono', 'deduccion_prestamo'];
+    const updates = {};
+    for (const k of allowed) if (k in body) updates[k] = Number(body[k]);
+    if (Object.keys(updates).length === 0) { const e=new Error('No hay campos vÃ¡lidos para actualizar'); e.status=400; throw e; }
+
+    const pool = await getPool();
+    const rowQ = await pool.request()
+      .input('id', sql.Int, id)
+      .query(`
+        SELECT p.*, e.idEmpleado, pu.salario_base
+        FROM dbo.Planillas p
+        JOIN dbo.Empleados e ON e.idEmpleado=p.idEmpleado
+        JOIN dbo.Puestos pu ON pu.idPuesto=e.idPuesto
+        WHERE p.idPlanilla=@id;
+      `);
+    if (!rowQ.recordset.length) { const e=new Error('Planilla no encontrada'); e.status=404; throw e; }
+    const row = rowQ.recordset[0];
+
+    const monto_bono = ('monto_bono' in updates) ? Number(updates.monto_bono) : Number(row.monto_bono || 0);
+    const deduccion_prestamo = ('deduccion_prestamo' in updates) ? Number(updates.deduccion_prestamo) : Number(row.deduccion_prestamo || 0);
+
+    // Ajustar bruto por cambio de bono
+    const bruto = Number(row.salario_bruto) - Number(row.monto_bono || 0) + Number(monto_bono);
+    const bancoPopular = Number(row.deduccion_bancopopular || 0);
+    const aportes = aportesSociales(bruto, {});
+    const ccssObrero = round2(Math.max(aportes.obrero - bancoPopular, 0));
+    // Usamos mensual como base cuando no hay marca de periodo almacenada
+    const renta = rentaPeriodoCR2025(Math.max(0, bruto - (ccssObrero + bancoPopular)), 'mensual');
+    const neto = round2(bruto - ccssObrero - bancoPopular - renta - deduccion_prestamo);
+
+    const ps = pool.request()
+      .input('id', sql.Int, id)
+      .input('monto_bono', sql.Decimal(10,2), round2(monto_bono))
+      .input('salario_bruto', sql.Decimal(10,2), round2(bruto))
+      .input('deduccion_ccss', sql.Decimal(10,2), ccssObrero)
+      .input('deduccion_renta', sql.Decimal(10,2), renta)
+      .input('deduccion_prestamo', sql.Decimal(10,2), round2(deduccion_prestamo))
+      .input('monto_pagado', sql.Decimal(10,2), neto);
+
+    const upd = await ps.query(`
+      UPDATE dbo.Planillas
+      SET monto_bono=@monto_bono,
+          salario_bruto=@salario_bruto,
+          deduccion_ccss=@deduccion_ccss,
+          deduccion_renta=@deduccion_renta,
+          deduccion_prestamo=@deduccion_prestamo,
+          monto_pagado=@monto_pagado
+      OUTPUT INSERTED.*
+      WHERE idPlanilla=@id;
+    `);
+
+    if (!upd.recordset.length) { const e=new Error('No se pudo actualizar'); e.status=400; throw e; }
+    res.json({ ok:true, data: upd.recordset[0] });
+  } catch (err) { next(err); }
+};
+
+// PATCH /api/planilla/:id/cerrar -> Marca como cerrada si existen columnas para ello
+// PATCH /api/planilla/:id/cerrar -> marca la planilla como cerrada/inmutable.
+exports.cerrar = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const userId = req.user?.sub || null;
+    const pool = await getPool();
+    const colsQ = await pool.request().query(`
+      SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Planillas') AND name IN ('cerrada','cerrada_por','fecha_cierre');
+    `);
+    const cols = new Set(colsQ.recordset.map(r => r.name));
+    if (cols.size === 0) {
+      return res.json({ ok:true, message:'Planilla marcada como cerrada (lÃ³gico). AuditorÃ­a registrada.' });
+    }
+    const ps = pool.request().input('id', sql.Int, id);
+    const sets = [];
+    if (cols.has('cerrada')) sets.push('cerrada=1');
+    if (cols.has('cerrada_por')) { sets.push('cerrada_por=@uid'); ps.input('uid', sql.Int, userId || 0); }
+    if (cols.has('fecha_cierre')) sets.push('fecha_cierre=GETDATE()');
+    const up = await ps.query(`
+      UPDATE dbo.Planillas SET ${sets.join(', ')} WHERE idPlanilla=@id;
+      SELECT * FROM dbo.Planillas WHERE idPlanilla=@id;
+    `);
+    res.json({ ok:true, data: up.recordsets?.[1]?.[0] || null });
+  } catch (err) { next(err); }
+};
+
+
+
+
